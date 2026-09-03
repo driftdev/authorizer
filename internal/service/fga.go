@@ -135,21 +135,29 @@ func (p *provider) resolveFgaSubject(ctx context.Context, meta RequestMetadata, 
 //
 // MACHINE vs USER vs DELEGATED — the classification keys ONLY on the token's
 // login_method claim:
-//   - login_method == constants.AuthRecipeMethodServiceAccount is stamped
-//     EXCLUSIVELY on client_credentials machine tokens
-//     (token.createMachineAccessToken). Those tokens have no resource-owner user
-//     (sub is the service account's surrogate id) and never carry an RFC 8693
-//     `act` delegation claim. Such a caller resolves to
-//     "service_account:<client_id>".
-//   - every other login_method (human recipes, sso) resolves to "user:<sub>".
+//   - login_method == constants.AuthRecipeMethodServiceAccount marks a MACHINE
+//     subject. It is stamped on client_credentials tokens
+//     (token.createMachineAccessToken) and on a delegated token whose SUBJECT is
+//     a service account (token.DelegationTokenConfig.ServiceAccountSubject).
+//     Either way `sub` is the service account's surrogate id and the caller
+//     resolves to "service_account:<client_id>".
+//   - every other login_method — INCLUDING its absence — resolves to
+//     "user:<sub>".
 //
-// This makes the delegation guard structural, not a runtime check: an RFC 8693
-// delegated token (token.CreateDelegatedAccessToken) is stateless, carries a
-// user `sub` plus an `act` chain, and carries NO login_method claim — so it can
-// never be classified as a machine subject and always resolves to "user:<sub>".
-// The security-critical rule (delegated and user tokens stay user subjects; only
-// autonomous machine tokens become service_account subjects) holds by
-// construction.
+// The absence rule is why the claim must be stamped. An earlier version relied
+// on a delegated token carrying NO login_method and concluded that a delegated
+// token "always resolves to user:<sub> by construction". That was correct for a
+// user subject and wrong for a machine one: a service account exchanging a
+// token got a credential with no login_method, so this function classified an
+// autonomous machine as a human user, flipping OpenFGA decisions from deny to
+// allow (GHSA-vq29-8q3c-3hrm). Classification follows the SUBJECT's real
+// identity, which the mint now records explicitly rather than leaving to be
+// inferred from a missing claim.
+//
+// Delegation is orthogonal to this split and is carried by actorID, not by
+// login_method: BOTH a user-subject and a machine-subject delegated token
+// resolve with a non-empty actorID, so delegationSubjects applies the
+// perms(agent) ∩ perms(subject) intersection to each identically.
 //
 // The actor is read from the same source as the subject, never from a second
 // lookup: authctx.Principal is populated ONLY by the gRPC interceptor, so a
@@ -173,17 +181,50 @@ func (p *provider) resolveFgaCaller(ctx context.Context, meta RequestMetadata) (
 	if callerID == "" {
 		return fgaCaller{}, nil
 	}
-	if loginMethod == constants.AuthRecipeMethodServiceAccount {
-		subject, err := p.machineFgaSubject(ctx, callerID)
-		if err != nil {
-			return fgaCaller{}, err
-		}
-		// A machine token never carries an `act` chain (see above), so a
-		// service_account subject is never delegated. Dropping any actorID here
-		// keeps that invariant enforced rather than merely documented.
-		return fgaCaller{subject: subject}, nil
+	// actorID is carried on BOTH branches, machine included.
+	//
+	// It used to be dropped for a machine subject, on the reasoning that a
+	// machine token never carries an `act` chain so a service_account subject
+	// is never delegated. That is true of a client_credentials token — which
+	// has no `act`, so actorID is "" there anyway — but NOT of a delegated
+	// token whose SUBJECT is a service account (the multi-hop agent chain).
+	// Since such a token now correctly carries login_method=service_account it
+	// classifies as a machine subject WITH an actor, and dropping the actor
+	// would collapse authority from perms(agent) ∩ perms(subject) to
+	// perms(subject) alone — trading identity laundering for privilege
+	// widening.
+	subject, err := p.fgaSubjectFor(ctx, callerID, loginMethod)
+	if err != nil {
+		return fgaCaller{}, err
 	}
-	return fgaCaller{subject: "user:" + callerID, actorID: actorID}, nil
+	return fgaCaller{subject: subject, actorID: actorID}, nil
+}
+
+// fgaSubjectFor maps a (subject id, login_method) pair to its canonical OpenFGA
+// subject. It is the SINGLE source of truth for that classification, shared by
+// resolveFgaCaller (which classifies the CALLER) and enforceRequiredRelations
+// (which classifies the identity a presented token represents).
+//
+// It exists because those two used to classify differently.
+// enforceRequiredRelations hardcoded "user:<id>", so a machine identity was
+// evaluated as a human user on that surface — the same laundering primitive as
+// GHSA-vq29-8q3c-3hrm, reachable without any delegation at all: a plain
+// client_credentials token presented to validate_jwt_token with
+// required_relations was answered against "user:<service-account-row-id>",
+// so a tuple written for a user-shaped principal satisfied a gate for an
+// autonomous machine. check_permissions denied the very same token, which is
+// precisely the "two answers to one authority question" this surface's own doc
+// comment warns about.
+//
+// Fail-closed: machineFgaSubject denies on any lookup failure, a client whose
+// kind is not service_account, an inactive client, or separator smuggling in
+// the client_id. A machine subject is therefore never silently downgraded to a
+// user subject.
+func (p *provider) fgaSubjectFor(ctx context.Context, subjectID, loginMethod string) (string, error) {
+	if loginMethod == constants.AuthRecipeMethodServiceAccount {
+		return p.machineFgaSubject(ctx, subjectID)
+	}
+	return "user:" + subjectID, nil
 }
 
 // machineFgaSubject maps an authenticated client_credentials caller — whose
@@ -299,7 +340,7 @@ func toContextualTuples(in []*model.FgaTupleInput) ([]engine.ContextualTuple, er
 // relation, same object. Two answers to one authority question is worse than
 // either answer: a gateway gating on required_relations would admit a request
 // the permission API refuses.
-func (p *provider) enforceRequiredRelations(ctx context.Context, meta RequestMetadata, log zerolog.Logger, userID string, required []*model.FgaRelationInput) error {
+func (p *provider) enforceRequiredRelations(ctx context.Context, meta RequestMetadata, log zerolog.Logger, userID, subjectLoginMethod string, required []*model.FgaRelationInput) error {
 	if len(required) == 0 {
 		return nil
 	}
@@ -316,7 +357,17 @@ func (p *provider) enforceRequiredRelations(ctx context.Context, meta RequestMet
 	if err != nil {
 		return PermissionDenied("unauthorized")
 	}
-	subjects, err := p.delegationSubjects(ctx, caller, "user:"+userID, metrics.FgaOpRequiredRelations)
+	// Classify the presented token's OWN identity, exactly as the permission
+	// APIs classify theirs. Hardcoding "user:"+userID here is what let a
+	// machine token be answered as a human user on this surface — see
+	// fgaSubjectFor.
+	subject, err := p.fgaSubjectFor(ctx, userID, subjectLoginMethod)
+	if err != nil {
+		metrics.RecordFgaCheck(metrics.FgaOpRequiredRelations, metrics.FgaResultError)
+		log.Debug().Err(err).Msg("required relations: failed to classify the token subject; denying")
+		return PermissionDenied("unauthorized")
+	}
+	subjects, err := p.delegationSubjects(ctx, caller, subject, metrics.FgaOpRequiredRelations)
 	if err != nil {
 		metrics.RecordFgaCheck(metrics.FgaOpRequiredRelations, metrics.FgaResultError)
 		log.Debug().Err(err).Msg("required relations: failed to resolve delegation subjects; denying")
